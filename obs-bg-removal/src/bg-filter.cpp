@@ -13,9 +13,15 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #pragma comment(lib, "dxgi.lib")
+
+#ifdef HAVE_OPENVINO
+#include <openvino/openvino.hpp>
+#include <map>
+#endif
 
 // ----------------------------------------------------------
 // SAFETY LIMITS
@@ -34,6 +40,17 @@
 #define PROP_INFER_SCALE  "infer_scale"
 #define PROP_RESPONSIVENESS "responsiveness"
 #define PROP_DEVICE       "inference_device"
+#define PROP_DELAY        "lock_to_frame"
+
+// Inference backend selection
+#define BACKEND_ORT 0
+#define BACKEND_OV  1
+
+// Special device_id sentinels selecting the OpenVINO backend. Real DML adapter
+// indices are >= 0, and -1 means ORT-on-CPU; these negative values route to
+// OpenVINO's native runtime instead.
+#define DEVICE_OV_GPU (-100)
+#define DEVICE_OV_CPU (-101)
 
 // ----------------------------------------------------------
 // Filter data
@@ -100,6 +117,33 @@ struct bg_filter_data {
 	uint32_t   prev_infer_h;
 	int        device_id;        // desired DML adapter index (-1 = CPU)
 	int        active_device_id; // device the live session is bound to
+
+	// Backend selection + OpenVINO state
+	int          backend;        // BACKEND_ORT or BACKEND_OV
+	std::string  backend_name;   // human-readable, for logging
+#ifdef HAVE_OPENVINO
+	ov::Core                  *ov_core;
+	std::shared_ptr<ov::Model> ov_model;
+	ov::CompiledModel         *ov_compiled;
+	ov::InferRequest          *ov_req;
+	uint32_t                   ov_compiled_w;  // padded dims the request is built for
+	uint32_t                   ov_compiled_h;
+	std::string                ov_device;      // "GPU" or "CPU"
+#endif
+
+	// Frame-locked ("delay") mode: hold each frame until its mask is ready,
+	// then composite the two together so the cutout never trails the video.
+	bool          delay_mode;
+	bool          pending_filled;  // pending_src holds a real frame yet?
+	gs_texture_t *pending_src;     // full-res copy of the frame sent to inference
+	gs_texture_t *shown_src;       // full-res frame currently displayed (locked)
+	gs_texture_t *shown_mask_tex;  // mask matching shown_src
+	uint32_t      shown_mask_w;
+	uint32_t      shown_mask_h;
+	uint64_t      stage_counter;   // increments each staged frame (render thread)
+	uint64_t      frame_id;        // id tagged on the staged frame (frame_mutex)
+	uint64_t      mask_id;         // id the latest mask matches (mask_mutex)
+	uint64_t      displayed_id;    // id currently latched into shown_*
 };
 
 // ----------------------------------------------------------
@@ -114,6 +158,13 @@ static obs_properties_t  *bg_filter_properties(void *data);
 static void               bg_filter_defaults(obs_data_t *settings);
 static bool               init_onnx(bg_filter_data *f, uint32_t w, uint32_t h);
 static void               inference_thread_func(bg_filter_data *f);
+#ifdef HAVE_OPENVINO
+static bool               init_openvino(bg_filter_data *f, uint32_t w, uint32_t h);
+static bool               ov_ensure_compiled(bg_filter_data *f, uint32_t PIW, uint32_t PIH);
+static bool               ov_infer_frame(bg_filter_data *f, std::vector<float> &rgb,
+					 uint32_t PIW, uint32_t PIH, size_t infer_pixels,
+					 std::vector<float> &pha_buf, bool stateless);
+#endif
 
 // ----------------------------------------------------------
 // Helpers
@@ -187,6 +238,11 @@ static void teardown_inference(bg_filter_data *f)
 		f->infer_thread.join();
 	f->initialized = false;
 	f->has_mask.store(false);
+	f->displayed_id  = 0;
+	f->mask_id       = 0;
+	f->frame_id      = 0;
+	f->stage_counter = 0;
+	f->pending_filled = false;
 	f->prev_mask.clear();
 	f->r1.clear(); f->r1_shape = {1,1,1,1};
 	f->r2.clear(); f->r2_shape = {1,1,1,1};
@@ -195,7 +251,132 @@ static void teardown_inference(bg_filter_data *f)
 	delete f->session;     f->session     = nullptr;
 	delete f->memory_info; f->memory_info = nullptr;
 	delete f->env;         f->env         = nullptr;
+#ifdef HAVE_OPENVINO
+	delete f->ov_req;      f->ov_req      = nullptr;
+	delete f->ov_compiled; f->ov_compiled = nullptr;
+	f->ov_model.reset();
+	delete f->ov_core;     f->ov_core     = nullptr;
+	f->ov_compiled_w = 0;
+	f->ov_compiled_h = 0;
+#endif
+	f->backend = BACKEND_ORT;
 }
+
+#ifdef HAVE_OPENVINO
+// ----------------------------------------------------------
+// OpenVINO: (re)compile the model for a given padded inference size.
+// Compilation is lazy (first frame) and repeats only when the inference
+// resolution changes, which is rare. Runs on the inference thread.
+// ----------------------------------------------------------
+static bool ov_ensure_compiled(bg_filter_data *f, uint32_t PIW, uint32_t PIH)
+{
+	if (f->ov_req && f->ov_compiled_w == PIW && f->ov_compiled_h == PIH)
+		return true;
+
+	try {
+		// Lock the dynamic model to static padded dims so the GPU can
+		// build an optimized kernel. RVM recurrent states are 1/2, 1/4,
+		// 1/8, 1/16 of the input spatially (PIW/PIH are multiples of 16).
+		std::map<std::string, ov::PartialShape> shapes;
+		shapes["src"] = ov::PartialShape{1, 3,  (int)PIH,       (int)PIW};
+		shapes["r1i"] = ov::PartialShape{1, 16, (int)(PIH/2),  (int)(PIW/2)};
+		shapes["r2i"] = ov::PartialShape{1, 20, (int)(PIH/4),  (int)(PIW/4)};
+		shapes["r3i"] = ov::PartialShape{1, 40, (int)(PIH/8),  (int)(PIW/8)};
+		shapes["r4i"] = ov::PartialShape{1, 64, (int)(PIH/16), (int)(PIW/16)};
+		f->ov_model->reshape(shapes);
+
+		// Precision: fp16 on the GPU (far faster on Arc, and visually
+		// indistinguishable for an alpha matte); fp32 on CPU where fp16
+		// would be emulated and slow.
+		ov::AnyMap cfg = { ov::hint::inference_precision(
+			f->ov_device == "GPU" ? ov::element::f16 : ov::element::f32) };
+
+		delete f->ov_req;      f->ov_req      = nullptr;
+		delete f->ov_compiled; f->ov_compiled = nullptr;
+
+		ov::CompiledModel cm =
+			f->ov_core->compile_model(f->ov_model, f->ov_device, cfg);
+		f->ov_compiled = new ov::CompiledModel(std::move(cm));
+		ov::InferRequest rq = f->ov_compiled->create_infer_request();
+		f->ov_req = new ov::InferRequest(std::move(rq));
+
+		f->ov_compiled_w = PIW;
+		f->ov_compiled_h = PIH;
+
+		// Cold start: properly-shaped zero recurrent states.
+		f->r1.assign((size_t)16 * (PIH/2)  * (PIW/2),  0.0f);
+		f->r2.assign((size_t)20 * (PIH/4)  * (PIW/4),  0.0f);
+		f->r3.assign((size_t)40 * (PIH/8)  * (PIW/8),  0.0f);
+		f->r4.assign((size_t)64 * (PIH/16) * (PIW/16), 0.0f);
+		f->prev_mask.clear();
+
+		obs_log(LOG_INFO,
+			"BG Removal: OpenVINO compiled for %ux%u on %s",
+			PIW, PIH, f->ov_device.c_str());
+		return true;
+
+	} catch (const std::exception &e) {
+		obs_log(LOG_ERROR, "BG Removal: OpenVINO compile failed: %s", e.what());
+		return false;
+	}
+}
+
+// ----------------------------------------------------------
+// OpenVINO: run one frame. Fills pha_buf (padded PIW x PIH) and refreshes
+// the recurrent states (f->r1..r4) from the model outputs.
+// ----------------------------------------------------------
+static bool ov_infer_frame(bg_filter_data *f, std::vector<float> &rgb,
+			   uint32_t PIW, uint32_t PIH, size_t infer_pixels,
+			   std::vector<float> &pha_buf, bool stateless)
+{
+	if (!ov_ensure_compiled(f, PIW, PIH))
+		return false;
+
+	// Inputs (zero-copy over our existing buffers).
+	f->ov_req->set_tensor("src",
+		ov::Tensor(ov::element::f32, ov::Shape{1,3,PIH,PIW}, rgb.data()));
+	f->ov_req->set_tensor("r1i",
+		ov::Tensor(ov::element::f32, ov::Shape{1,16,PIH/2,PIW/2},   f->r1.data()));
+	f->ov_req->set_tensor("r2i",
+		ov::Tensor(ov::element::f32, ov::Shape{1,20,PIH/4,PIW/4},   f->r2.data()));
+	f->ov_req->set_tensor("r3i",
+		ov::Tensor(ov::element::f32, ov::Shape{1,40,PIH/8,PIW/8},   f->r3.data()));
+	f->ov_req->set_tensor("r4i",
+		ov::Tensor(ov::element::f32, ov::Shape{1,64,PIH/16,PIW/16}, f->r4.data()));
+
+	float ratio_val = 1.0f;
+	f->ov_req->set_tensor("downsample_ratio",
+		ov::Tensor(ov::element::f32, ov::Shape{1}, &ratio_val));
+
+	f->ov_req->infer();
+
+	ov::Tensor pha_t = f->ov_req->get_tensor("pha");
+	if (pha_t.get_size() != infer_pixels) {
+		obs_log(LOG_ERROR,
+			"BG Removal: OV alpha size mismatch expected=%zu got=%zu",
+			infer_pixels, (size_t)pha_t.get_size());
+		return false;
+	}
+	const float *p = pha_t.data<float>();
+	pha_buf.assign(p, p + infer_pixels);
+
+	// Refresh recurrent states from the model's r1o..r4o outputs. At full
+	// responsiveness the states are zeroed every frame anyway, so we skip the
+	// read-back entirely - that avoids copying ~3 MB GPU->host each frame.
+	if (!stateless) {
+		auto upd = [&](const char *name, std::vector<float> &s) {
+			ov::Tensor t = f->ov_req->get_tensor(name);
+			const float *d = t.data<float>();
+			s.assign(d, d + t.get_size());
+		};
+		upd("r1o", f->r1);
+		upd("r2o", f->r2);
+		upd("r3o", f->r3);
+		upd("r4o", f->r4);
+	}
+	return true;
+}
+#endif // HAVE_OPENVINO
 
 // ----------------------------------------------------------
 // Background inference thread
@@ -216,7 +397,10 @@ static void inference_thread_func(bg_filter_data *f)
 			f->frame_ready.store(false);
 		}
 
-		if (!f->session || !f->memory_info) continue;
+		// ORT needs a live session + memory_info; the OpenVINO backend
+		// manages its own request and has neither.
+		if (f->backend == BACKEND_ORT && (!f->session || !f->memory_info))
+			continue;
 		f->infer_busy.store(true);
 
 		uint32_t W = f->width;
@@ -237,12 +421,14 @@ static void inference_thread_func(bg_filter_data *f)
 		std::vector<uint8_t> local_frame;
 		uint32_t local_linesize = 0;
 		uint32_t IW, IH;
+		uint64_t local_id = 0;
 		{
 			std::lock_guard<std::mutex> lock(f->frame_mutex);
 			local_frame    = f->frame_bgra;
 			local_linesize = f->frame_linesize;
 			IW = f->frame_infer_w;
 			IH = f->frame_infer_h;
+			local_id = f->frame_id;
 		}
 		if (local_frame.empty() || !IW || !IH) {
 			f->infer_busy.store(false); continue;
@@ -253,10 +439,14 @@ static void inference_thread_func(bg_filter_data *f)
 			obs_log(LOG_INFO,
 				"BG Removal: Infer size changed %dx%d -> %dx%d, resetting states",
 				f->prev_infer_w, f->prev_infer_h, IW, IH);
-			f->r1 = {0.0f}; f->r1_shape = {1,1,1,1};
-			f->r2 = {0.0f}; f->r2_shape = {1,1,1,1};
-			f->r3 = {0.0f}; f->r3_shape = {1,1,1,1};
-			f->r4 = {0.0f}; f->r4_shape = {1,1,1,1};
+			// ORT bootstraps from {1,1,1,1}; the OpenVINO backend resets to
+			// properly-shaped zero states when it (re)compiles for the new size.
+			if (f->backend == BACKEND_ORT) {
+				f->r1 = {0.0f}; f->r1_shape = {1,1,1,1};
+				f->r2 = {0.0f}; f->r2_shape = {1,1,1,1};
+				f->r3 = {0.0f}; f->r3_shape = {1,1,1,1};
+				f->r4 = {0.0f}; f->r4_shape = {1,1,1,1};
+			}
 			f->prev_mask.clear();
 			f->prev_infer_w = IW;
 			f->prev_infer_h = IH;
@@ -288,15 +478,9 @@ static void inference_thread_func(bg_filter_data *f)
 				}
 			}
 
-			std::vector<int64_t> src_shape = {1,3,(int64_t)PIH,(int64_t)PIW};
-
-			// downsample_ratio must be 1.0 - other values crash DirectML
-			float ratio_val = 1.0f;
-			std::vector<int64_t> ratio_shape = {1};
-
-			// Responsiveness: decay recurrent states to reduce temporal memory.
-			// 1.0 = full decay (model treats each frame independently)
-			// 0.0 = no decay (full temporal memory, smoothest but laggiest)
+			// Responsiveness: decay recurrent states to reduce temporal
+			// memory. 1.0 = treat each frame independently; 0.0 = full
+			// temporal memory (smoothest but laggiest). Shared by both backends.
 			if (responsiveness > 0.001f) {
 				float keep = 1.0f - responsiveness;
 				for (auto &v : f->r1) v *= keep;
@@ -305,70 +489,101 @@ static void inference_thread_func(bg_filter_data *f)
 				for (auto &v : f->r4) v *= keep;
 			}
 
-			auto mkt = [&](std::vector<float> &buf,
-				       std::vector<int64_t> &shape) -> Ort::Value {
-				return Ort::Value::CreateTensor<float>(
-					*f->memory_info,
-					buf.data(), buf.size(),
-					shape.data(), shape.size());
-			};
-
-			std::vector<Ort::Value> inputs;
-			inputs.reserve(6);
-			inputs.push_back(mkt(rgb,   src_shape));
-			inputs.push_back(mkt(f->r1, f->r1_shape));
-			inputs.push_back(mkt(f->r2, f->r2_shape));
-			inputs.push_back(mkt(f->r3, f->r3_shape));
-			inputs.push_back(mkt(f->r4, f->r4_shape));
-			inputs.push_back(Ort::Value::CreateTensor<float>(
-				*f->memory_info, &ratio_val, 1,
-				ratio_shape.data(), ratio_shape.size()));
-
-			const char *inames[] = {"src","r1i","r2i","r3i","r4i",
-						"downsample_ratio"};
-			const char *onames[] = {"fgr","pha","r1o","r2o","r3o","r4o"};
-
 			auto t_pre = std::chrono::steady_clock::now();
+			std::chrono::steady_clock::time_point t_infer;
 
-			auto out = f->session->Run(
-				Ort::RunOptions{nullptr},
-				inames, inputs.data(), 6,
-				onames, 6);
+			// Alpha for this frame, padded PIW x PIH layout. Each backend
+			// fills this and refreshes the recurrent states (f->r1..r4).
+			std::vector<float> pha_buf;
 
-			auto t_infer = std::chrono::steady_clock::now();
-
-			if (out.size() != 6) {
-				obs_log(LOG_ERROR, "BG Removal: Expected 6 outputs got %zu",
-					out.size());
+			if (f->backend == BACKEND_OV) {
+#ifdef HAVE_OPENVINO
+				if (!ov_infer_frame(f, rgb, PIW, PIH,
+						     infer_pixels, pha_buf,
+						     responsiveness >= 0.999f)) {
+					f->infer_busy.store(false);
+					continue;
+				}
+				t_infer = std::chrono::steady_clock::now();
+#else
 				f->infer_busy.store(false);
 				continue;
+#endif
+			} else {
+				std::vector<int64_t> src_shape =
+					{1,3,(int64_t)PIH,(int64_t)PIW};
+				// downsample_ratio must be 1.0 - other values crash DirectML
+				float ratio_val = 1.0f;
+				std::vector<int64_t> ratio_shape = {1};
+
+				auto mkt = [&](std::vector<float> &buf,
+					       std::vector<int64_t> &shape) -> Ort::Value {
+					return Ort::Value::CreateTensor<float>(
+						*f->memory_info,
+						buf.data(), buf.size(),
+						shape.data(), shape.size());
+				};
+
+				std::vector<Ort::Value> inputs;
+				inputs.reserve(6);
+				inputs.push_back(mkt(rgb,   src_shape));
+				inputs.push_back(mkt(f->r1, f->r1_shape));
+				inputs.push_back(mkt(f->r2, f->r2_shape));
+				inputs.push_back(mkt(f->r3, f->r3_shape));
+				inputs.push_back(mkt(f->r4, f->r4_shape));
+				inputs.push_back(Ort::Value::CreateTensor<float>(
+					*f->memory_info, &ratio_val, 1,
+					ratio_shape.data(), ratio_shape.size()));
+
+				const char *inames[] = {"src","r1i","r2i","r3i","r4i",
+							"downsample_ratio"};
+				const char *onames[] = {"fgr","pha","r1o","r2o","r3o","r4o"};
+
+				auto out = f->session->Run(
+					Ort::RunOptions{nullptr},
+					inames, inputs.data(), 6,
+					onames, 6);
+
+				t_infer = std::chrono::steady_clock::now();
+
+				if (out.size() != 6) {
+					obs_log(LOG_ERROR,
+						"BG Removal: Expected 6 outputs got %zu",
+						out.size());
+					f->infer_busy.store(false);
+					continue;
+				}
+
+				size_t pha_n = out[1].GetTensorTypeAndShapeInfo()
+						.GetElementCount();
+				if (pha_n != infer_pixels) {
+					obs_log(LOG_ERROR,
+						"BG Removal: Alpha size mismatch expected=%zu got=%zu",
+						infer_pixels, pha_n);
+					f->infer_busy.store(false);
+					continue;
+				}
+
+				// Update recurrent states from model outputs
+				auto upd = [](Ort::Value &t,
+					      std::vector<float> &s,
+					      std::vector<int64_t> &sh) {
+					auto info = t.GetTensorTypeAndShapeInfo();
+					sh = info.GetShape();
+					size_t n = info.GetElementCount();
+					float *p = t.GetTensorMutableData<float>();
+					s.assign(p, p + n);
+				};
+				upd(out[2], f->r1, f->r1_shape);
+				upd(out[3], f->r2, f->r2_shape);
+				upd(out[4], f->r3, f->r3_shape);
+				upd(out[5], f->r4, f->r4_shape);
+
+				float *p = out[1].GetTensorMutableData<float>();
+				pha_buf.assign(p, p + infer_pixels);
 			}
 
-			size_t pha_n = out[1].GetTensorTypeAndShapeInfo().GetElementCount();
-			if (pha_n != infer_pixels) {
-				obs_log(LOG_ERROR,
-					"BG Removal: Alpha size mismatch expected=%zu got=%zu",
-					infer_pixels, pha_n);
-				f->infer_busy.store(false);
-				continue;
-			}
-
-			// Update recurrent states from model outputs
-			auto upd = [](Ort::Value &t,
-				      std::vector<float> &s,
-				      std::vector<int64_t> &sh) {
-				auto info = t.GetTensorTypeAndShapeInfo();
-				sh = info.GetShape();
-				size_t n = info.GetElementCount();
-				float *p = t.GetTensorMutableData<float>();
-				s.assign(p, p + n);
-			};
-			upd(out[2], f->r1, f->r1_shape);
-			upd(out[3], f->r2, f->r2_shape);
-			upd(out[4], f->r3, f->r3_shape);
-			upd(out[5], f->r4, f->r4_shape);
-
-			float *pha = out[1].GetTensorMutableData<float>();
+			const float *pha = pha_buf.data();
 
 			size_t infer_unpadded = (size_t)IW * IH;
 
@@ -462,6 +677,7 @@ static void inference_thread_func(bg_filter_data *f)
 				f->mask_rgba = std::move(new_mask);
 				f->mask_w = IW;
 				f->mask_h = IH;
+				f->mask_id = local_id;
 			}
 			f->has_mask.store(true);
 			f->error_count = 0;
@@ -484,7 +700,7 @@ static void inference_thread_func(bg_filter_data *f)
 					"BG Removal: Frame %d | %s %dx%d | "
 					"prep=%.1fms infer=%.1fms mask=%.1fms total=%.1fms (%.0ffps)",
 					f->frame_count,
-					f->using_cuda ? "DirectML" : "CPU",
+					f->backend_name.c_str(),
 					IW, IH,
 					ms(t_start, t_pre),
 					ms(t_pre, t_infer),
@@ -505,6 +721,11 @@ static void inference_thread_func(bg_filter_data *f)
 		} catch (const std::exception &e) {
 			f->error_count++;
 			obs_log(LOG_ERROR, "BG Removal: Error: %s", e.what());
+			if (f->error_count >= 10) {
+				obs_log(LOG_ERROR, "BG Removal: Too many errors.");
+				f->failed = true;
+				f->running.store(false);
+			}
 		} catch (...) {
 			f->error_count++;
 			obs_log(LOG_ERROR, "BG Removal: Unknown error (x%d)", f->error_count);
@@ -629,12 +850,14 @@ static bool init_onnx(bg_filter_data *f, uint32_t W, uint32_t H)
 		f->width       = W;
 		f->height      = H;
 		f->initialized = true;
+		f->backend     = BACKEND_ORT;
+		f->backend_name = f->using_cuda ? "DirectML(GPU)" : "CPU";
 
 		f->running.store(true);
 		f->infer_thread = std::thread(inference_thread_func, f);
 
 		obs_log(LOG_INFO, "BG Removal: *** READY! Backend=%s %dx%d ***",
-			f->using_cuda ? "DirectML(GPU)" : "CPU", W, H);
+			f->backend_name.c_str(), W, H);
 		return true;
 
 	} catch (const Ort::Exception &e) {
@@ -649,6 +872,92 @@ static bool init_onnx(bg_filter_data *f, uint32_t W, uint32_t H)
 	}
 	return false;
 }
+
+#ifdef HAVE_OPENVINO
+// ----------------------------------------------------------
+// Initialize the OpenVINO backend (Intel Arc / GPU via the native runtime).
+// The model is read here; compilation happens lazily on the first frame, once
+// the inference resolution is known (see ov_ensure_compiled).
+// ----------------------------------------------------------
+static bool init_openvino(bg_filter_data *f, uint32_t W, uint32_t H)
+{
+	obs_log(LOG_INFO, "BG Removal: Initializing OpenVINO for %dx%d...", W, H);
+
+	if (!validate_dims(W, H)) {
+		obs_log(LOG_ERROR, "BG Removal: Invalid dims %dx%d", W, H);
+		return false;
+	}
+
+	try {
+		int dev;
+		{
+			std::lock_guard<std::mutex> lock(f->settings_mutex);
+			dev = f->device_id;
+		}
+		f->active_device_id = dev;
+		f->ov_device = (dev == DEVICE_OV_CPU) ? "CPU" : "GPU";
+
+		f->ov_core = new ov::Core();
+
+		// Cache compiled GPU kernels to a temp dir so we don't pay the
+		// (multi-second) first-compile cost on every launch or resolution
+		// change - only the very first time for a given size.
+		{
+			const char *tmp = std::getenv("TEMP");
+			if (!tmp) tmp = std::getenv("TMP");
+			if (tmp) {
+				try {
+					f->ov_core->set_property(ov::cache_dir(
+						std::string(tmp) + "\\obs-bg-removal-ov-cache"));
+				} catch (...) {}
+			}
+		}
+
+		char *mpath = obs_module_file("models/rvm_mobilenetv3_fp32.onnx");
+		if (!mpath) {
+			obs_log(LOG_ERROR, "BG Removal: Model not found!");
+			return false;
+		}
+		std::string ps(mpath);
+		bfree(mpath);
+		obs_log(LOG_INFO, "BG Removal: Model: %s", ps.c_str());
+
+		// OpenVINO reads the .onnx directly via its ONNX frontend.
+		f->ov_model = f->ov_core->read_model(ps);
+		if (f->ov_model->inputs().size() != 6 ||
+		    f->ov_model->outputs().size() != 6) {
+			obs_log(LOG_ERROR, "BG Removal: Wrong model format (OpenVINO)!");
+			return false;
+		}
+
+		f->ov_compiled   = nullptr;   // compiled lazily on first frame
+		f->ov_req        = nullptr;
+		f->ov_compiled_w = 0;
+		f->ov_compiled_h = 0;
+
+		f->using_cuda   = (f->ov_device == "GPU");  // "GPU accel active" flag
+		f->backend      = BACKEND_OV;
+		f->backend_name = "OpenVINO " + f->ov_device;
+
+		f->width       = W;
+		f->height      = H;
+		f->initialized = true;
+
+		f->running.store(true);
+		f->infer_thread = std::thread(inference_thread_func, f);
+
+		obs_log(LOG_INFO, "BG Removal: *** READY! Backend=%s %dx%d ***",
+			f->backend_name.c_str(), W, H);
+		return true;
+
+	} catch (const std::exception &e) {
+		obs_log(LOG_ERROR, "BG Removal: OpenVINO init error: %s", e.what());
+	} catch (...) {
+		obs_log(LOG_ERROR, "BG Removal: Unknown OpenVINO init error!");
+	}
+	return false;
+}
+#endif // HAVE_OPENVINO
 
 // ----------------------------------------------------------
 // Filter name
@@ -685,6 +994,10 @@ static obs_properties_t *bg_filter_properties(void *data)
 			 a.name.c_str(), gb);
 		obs_property_list_add_int(p, label, a.index);
 	}
+#ifdef HAVE_OPENVINO
+	obs_property_list_add_int(p, "Intel Arc / iGPU (OpenVINO)", DEVICE_OV_GPU);
+	obs_property_list_add_int(p, "OpenVINO CPU (test)", DEVICE_OV_CPU);
+#endif
 	obs_property_list_add_int(p, "CPU (no GPU acceleration)", -1);
 	obs_property_set_long_description(p,
 		"Which GPU runs the AI inference. On a multi-GPU system you can "
@@ -692,12 +1005,20 @@ static obs_properties_t *bg_filter_properties(void *data)
 		"your main GPU for rendering and encoding. Changing this rebuilds "
 		"the model session.");
 
+	p = obs_properties_add_bool(props, PROP_DELAY,
+		"Lock mask to frame (removes trailing; adds slight delay)");
+	obs_property_set_long_description(p,
+		"Holds each frame until its mask is ready, then composites them "
+		"together so the cutout edges never trail your movement. Costs a "
+		"small constant delay on the cam feed (about one inference cycle), "
+		"and the feed updates at the inference rate - keep Inference Scale "
+		"low enough to stay near 60fps for smooth motion.");
+
 	p = obs_properties_add_float_slider(props, PROP_INFER_SCALE,
-		"Inference Scale", 0.25, 1.0, 0.05);
+		"Inference Scale", 0.10, 1.0, 0.05);
 	obs_property_set_long_description(p,
 		"Scales the frame before AI inference, then upscales the mask on GPU. "
-		"Lower = faster tracking, higher = sharper mask edges. "
-		"0.25 is optimal for 60fps on most GPUs.");
+		"Lower = faster inference / less lag, higher = sharper mask edges.");
 
 	obs_properties_add_text(props, "info_scale",
 		"Controls how fast the mask tracks your movement. "
@@ -786,6 +1107,7 @@ static void bg_filter_defaults(obs_data_t *settings)
 	obs_data_set_default_int(settings, PROP_EROSION,   1);
 	obs_data_set_default_int(settings, PROP_EDGE_BLUR, 1);
 	obs_data_set_default_double(settings, PROP_SMOOTHING, 0.05);
+	obs_data_set_default_bool(settings, PROP_DELAY, false);
 }
 
 static void bg_filter_update(void *data, obs_data_t *settings)
@@ -801,6 +1123,7 @@ static void bg_filter_update(void *data, obs_data_t *settings)
 	f->infer_scale     = (float)obs_data_get_double(settings, PROP_INFER_SCALE);
 	f->responsiveness  = (float)obs_data_get_double(settings, PROP_RESPONSIVENESS);
 	f->device_id       = (int)obs_data_get_int(settings, PROP_DEVICE);
+	f->delay_mode      = obs_data_get_bool(settings, PROP_DELAY);
 }
 
 // ----------------------------------------------------------
@@ -852,6 +1175,25 @@ static void *bg_filter_create(obs_data_t *settings, obs_source_t *source)
 	f->prev_infer_h    = 0;
 	f->device_id       = 0;
 	f->active_device_id = -2;  // sentinel: no live session yet
+	f->backend          = BACKEND_ORT;
+#ifdef HAVE_OPENVINO
+	f->ov_core          = nullptr;
+	f->ov_compiled      = nullptr;
+	f->ov_req           = nullptr;
+	f->ov_compiled_w    = 0;
+	f->ov_compiled_h    = 0;
+#endif
+	f->delay_mode       = false;
+	f->pending_filled   = false;
+	f->pending_src      = nullptr;
+	f->shown_src        = nullptr;
+	f->shown_mask_tex   = nullptr;
+	f->shown_mask_w     = 0;
+	f->shown_mask_h     = 0;
+	f->stage_counter    = 0;
+	f->frame_id         = 0;
+	f->mask_id          = 0;
+	f->displayed_id     = 0;
 
 	bg_filter_update(f, settings);
 
@@ -912,6 +1254,9 @@ static void bg_filter_destroy(void *data)
 	if (f->small_texrender) { gs_texrender_destroy(f->small_texrender); f->small_texrender = nullptr; }
 	if (f->staging)         { gs_stagesurface_destroy(f->staging);      f->staging         = nullptr; }
 	if (f->mask_tex)        { gs_texture_destroy(f->mask_tex);          f->mask_tex        = nullptr; }
+	if (f->pending_src)     { gs_texture_destroy(f->pending_src);       f->pending_src     = nullptr; }
+	if (f->shown_src)       { gs_texture_destroy(f->shown_src);         f->shown_src       = nullptr; }
+	if (f->shown_mask_tex)  { gs_texture_destroy(f->shown_mask_tex);    f->shown_mask_tex  = nullptr; }
 	if (f->mask_effect)     { gs_effect_destroy(f->mask_effect);        f->mask_effect     = nullptr; }
 	if (f->linear_sampler)  { gs_samplerstate_destroy(f->linear_sampler); f->linear_sampler = nullptr; }
 	obs_leave_graphics();
@@ -919,6 +1264,12 @@ static void bg_filter_destroy(void *data)
 	delete f->session;     f->session     = nullptr;
 	delete f->memory_info; f->memory_info = nullptr;
 	delete f->env;         f->env         = nullptr;
+#ifdef HAVE_OPENVINO
+	delete f->ov_req;      f->ov_req      = nullptr;
+	delete f->ov_compiled; f->ov_compiled = nullptr;
+	f->ov_model.reset();
+	delete f->ov_core;     f->ov_core     = nullptr;
+#endif
 	delete f;
 
 	obs_log(LOG_INFO, "BG Removal: Destroyed cleanly");
@@ -971,7 +1322,19 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 	}
 
 	if (!f->initialized) {
-		if (!init_onnx(f, W, H)) {
+		int dev;
+		{
+			std::lock_guard<std::mutex> lock(f->settings_mutex);
+			dev = f->device_id;
+		}
+		bool ok;
+#ifdef HAVE_OPENVINO
+		if (dev == DEVICE_OV_GPU || dev == DEVICE_OV_CPU)
+			ok = init_openvino(f, W, H);
+		else
+#endif
+			ok = init_onnx(f, W, H);
+		if (!ok) {
 			f->failed = true;
 			obs_source_skip_video_filter(f->source);
 			return;
@@ -994,14 +1357,90 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 	gs_texture_t *src_tex = gs_texrender_get_texture(f->texrender);
 	if (!src_tex) { obs_source_skip_video_filter(f->source); return; }
 
-	// Only stage when inference thread is idle (skip costly GPU->CPU copy otherwise)
-	if (!f->infer_busy.load() && f->small_texrender) {
-		// Compute inference dimensions
-		float cur_scale;
-		{
-			std::lock_guard<std::mutex> lock(f->settings_mutex);
-			cur_scale = f->infer_scale;
+	bool  delay_mode;
+	float cur_scale;
+	{
+		std::lock_guard<std::mutex> lock(f->settings_mutex);
+		delay_mode = f->delay_mode;
+		cur_scale  = f->infer_scale;
+	}
+
+	// Composite helper: draw `color` through the mask shader using `mask`.
+	auto draw_composite = [&](gs_texture_t *color, gs_texture_t *mask) -> bool {
+		gs_eparam_t *p_img = gs_effect_get_param_by_name(f->mask_effect, "image");
+		gs_eparam_t *p_msk = gs_effect_get_param_by_name(f->mask_effect, "mask_tex");
+		if (!p_img || !p_msk) return false;
+		gs_blend_state_push();
+		gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+		gs_effect_set_texture(p_img, color);
+		gs_effect_set_next_sampler(p_msk, f->linear_sampler);
+		gs_effect_set_texture(p_msk, mask);
+		while (gs_effect_loop(f->mask_effect, "Draw"))
+			gs_draw_sprite(color, 0, W, H);
+		gs_blend_state_pop();
+		return true;
+	};
+
+	// --- Frame-locked mode: latch the finished (frame, mask) pair BEFORE we
+	//     stage a new frame (staging overwrites pending_src). ---
+	if (delay_mode) {
+		if (!f->pending_src ||
+		    gs_texture_get_width(f->pending_src)  != W ||
+		    gs_texture_get_height(f->pending_src) != H) {
+			if (f->pending_src) gs_texture_destroy(f->pending_src);
+			f->pending_src = gs_texture_create(W, H, GS_BGRA, 1, nullptr,
+							   GS_RENDER_TARGET);
+			f->pending_filled = false;
+			f->displayed_id = 0;
 		}
+		if (!f->shown_src ||
+		    gs_texture_get_width(f->shown_src)  != W ||
+		    gs_texture_get_height(f->shown_src) != H) {
+			if (f->shown_src) gs_texture_destroy(f->shown_src);
+			f->shown_src = gs_texture_create(W, H, GS_BGRA, 1, nullptr,
+							 GS_RENDER_TARGET);
+			f->displayed_id = 0;
+		}
+
+		std::vector<uint8_t> lmask;
+		uint32_t lmw = 0, lmh = 0;
+		uint64_t lid = 0;
+		bool got = false;
+		{
+			std::lock_guard<std::mutex> lock(f->mask_mutex);
+			if (f->has_mask.load() && f->mask_id != f->displayed_id) {
+				lmask = f->mask_rgba;
+				lmw = f->mask_w;
+				lmh = f->mask_h;
+				lid = f->mask_id;
+				got = true;
+			}
+		}
+		if (got && f->pending_filled && f->pending_src && f->shown_src &&
+		    !lmask.empty() && lmw && lmh) {
+			// shown_src <- the exact frame this mask was computed from
+			gs_copy_texture(f->shown_src, f->pending_src);
+
+			if (!f->shown_mask_tex ||
+			    gs_texture_get_width(f->shown_mask_tex)  != lmw ||
+			    gs_texture_get_height(f->shown_mask_tex) != lmh) {
+				if (f->shown_mask_tex)
+					gs_texture_destroy(f->shown_mask_tex);
+				f->shown_mask_tex = gs_texture_create(
+					lmw, lmh, GS_BGRA, 1, nullptr, GS_DYNAMIC);
+			}
+			if (f->shown_mask_tex) {
+				gs_texture_set_image(f->shown_mask_tex,
+						     lmask.data(), lmw * 4, false);
+				f->shown_mask_w = lmw;
+				f->shown_mask_h = lmh;
+				f->displayed_id = lid;
+			}
+		}
+	}
+
+	// Stage a frame for inference when the worker is idle.
+	if (!f->infer_busy.load() && f->small_texrender) {
 		uint32_t IW = std::max((uint32_t)(W * cur_scale), (uint32_t)MIN_WIDTH);
 		uint32_t IH = std::max((uint32_t)(H * cur_scale), (uint32_t)MIN_HEIGHT);
 		IW &= ~1u;
@@ -1029,6 +1468,12 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 				}
 
 				if (f->staging) {
+					// Keep the matching full-res frame for locked mode.
+					if (delay_mode && f->pending_src) {
+						gs_copy_texture(f->pending_src, src_tex);
+						f->pending_filled = true;
+					}
+
 					gs_stage_texture(f->staging, small_tex);
 					uint8_t *mapped = nullptr;
 					uint32_t linesize = 0;
@@ -1041,6 +1486,7 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 						f->frame_linesize = linesize;
 						f->frame_infer_w  = IW;
 						f->frame_infer_h  = IH;
+						f->frame_id       = ++f->stage_counter;
 						f->frame_ready.store(true);
 						f->frame_cv.notify_one();
 					}
@@ -1050,7 +1496,19 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 		}
 	}
 
-	// Render mask if available
+	// --- Draw ---
+	if (delay_mode) {
+		if (f->displayed_id != 0 && f->shown_src && f->shown_mask_tex &&
+		    f->shown_mask_w && f->shown_mask_h) {
+			if (draw_composite(f->shown_src, f->shown_mask_tex))
+				return;
+		}
+		// Nothing locked yet (just enabled / first frames): passthrough.
+		obs_source_skip_video_filter(f->source);
+		return;
+	}
+
+	// Render mask if available (live/non-locked path)
 	if (f->has_mask.load()) {
 		std::vector<uint8_t> local_mask;
 		uint32_t mw, mh;
@@ -1082,25 +1540,9 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 			gs_texture_set_image(f->mask_tex,
 					     local_mask.data(), mw * 4, false);
 
-			gs_eparam_t *p_img = gs_effect_get_param_by_name(
-				f->mask_effect, "image");
-			gs_eparam_t *p_msk = gs_effect_get_param_by_name(
-				f->mask_effect, "mask_tex");
-
-			if (!p_img || !p_msk) {
-				obs_source_skip_video_filter(f->source);
+			if (draw_composite(src_tex, f->mask_tex))
 				return;
-			}
-
-			gs_blend_state_push();
-			gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
-			gs_effect_set_texture(p_img, src_tex);
-			// Set linear sampler so GPU does bilinear upscale
-			gs_effect_set_next_sampler(p_msk, f->linear_sampler);
-			gs_effect_set_texture(p_msk, f->mask_tex);
-			while (gs_effect_loop(f->mask_effect, "Draw"))
-				gs_draw_sprite(src_tex, 0, W, H);
-			gs_blend_state_pop();
+			obs_source_skip_video_filter(f->source);
 			return;
 		}
 	}

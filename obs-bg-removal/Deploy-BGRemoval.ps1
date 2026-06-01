@@ -61,6 +61,29 @@ if (-not (Test-Path $OrtShared)) {
     }
 }
 
+# OpenVINO runtime + plugins + TBB.
+# Staged next to the plugin DLL by the CMake POST_BUILD step when built with
+# the OpenVINO backend; copied here so OBS can load them. Silently skipped for
+# an ONNX-Runtime-only build.
+$OvDlls = @(
+    "openvino.dll",
+    "openvino_intel_gpu_plugin.dll",
+    "openvino_intel_cpu_plugin.dll",
+    "openvino_onnx_frontend.dll",
+    "openvino_ir_frontend.dll",
+    "tbb12.dll",
+    "tbbbind_2_5.dll",
+    "tbbmalloc.dll",
+    "tbbmalloc_proxy.dll"
+)
+foreach ($name in $OvDlls) {
+    $src = "$BuildDir\$name"
+    if (Test-Path $src) {
+        Copy-Item $src "$PluginDir\" -Force
+        Write-Host "  $name -> $PluginDir" -ForegroundColor Green
+    }
+}
+
 # Data files (shader + model)
 New-Item -ItemType Directory -Path "$DataDir\effects" -Force | Out-Null
 New-Item -ItemType Directory -Path "$DataDir\models" -Force | Out-Null
