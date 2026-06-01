@@ -1,16 +1,26 @@
 # ============================================================
 # Deploy-BGRemoval.ps1 (updated for shads-obs-bg-removal rename)
 # Deploys built plugin + data to OBS Studio installation
-# Run from: C:\Projects\obs-bg-removal\
+# Run from anywhere; paths auto-detect from this script's location ($PSScriptRoot).
 # ============================================================
 
 $ErrorActionPreference = 'Stop'
 
-$ProjectRoot = "C:\Projects\obs-bg-removal"
-$BuildDir    = "$ProjectRoot\build_x64\Release"
+$ProjectRoot = $PSScriptRoot
+# Build config: prefer RelWithDebInfo (the preset default), fall back to Release
+$BuildDir    = "$ProjectRoot\build_x64\RelWithDebInfo"
+if (-not (Test-Path "$BuildDir\shads-obs-bg-removal.dll") -and
+    (Test-Path "$ProjectRoot\build_x64\Release\shads-obs-bg-removal.dll")) {
+    $BuildDir = "$ProjectRoot\build_x64\Release"
+}
 $OBSDir      = "C:\Program Files\obs-studio"
 $PluginDir   = "$OBSDir\obs-plugins\64bit"
 $DataDir     = "$OBSDir\data\obs-plugins\shads-obs-bg-removal"
+
+if (-not (Test-Path $OBSDir)) {
+    Write-Host "ERROR: OBS not found at $OBSDir. Set `$OBSDir at the top of this script to your OBS install path." -ForegroundColor Red
+    exit 1
+}
 
 # Check build exists
 $DLL = "$BuildDir\shads-obs-bg-removal.dll"
@@ -34,7 +44,7 @@ Write-Host "  DLL -> $PluginDir" -ForegroundColor Green
 $OrtDLL = "$PluginDir\onnxruntime.dll"
 if (-not (Test-Path $OrtDLL)) {
     $SrcOrt = @(
-        "C:\Projects\deps\onnxruntime\lib\onnxruntime.dll"
+        "$ProjectRoot\deps\onnxruntime\lib\onnxruntime.dll"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($SrcOrt) {
         Copy-Item $SrcOrt $PluginDir\ -Force
@@ -44,7 +54,7 @@ if (-not (Test-Path $OrtDLL)) {
 
 $OrtShared = "$PluginDir\onnxruntime_providers_shared.dll"
 if (-not (Test-Path $OrtShared)) {
-    $SrcShared = "C:\Projects\deps\onnxruntime\lib\onnxruntime_providers_shared.dll"
+    $SrcShared = "$ProjectRoot\deps\onnxruntime\lib\onnxruntime_providers_shared.dll"
     if (Test-Path $SrcShared) {
         Copy-Item $SrcShared $PluginDir\ -Force
         Write-Host "  onnxruntime_providers_shared.dll -> $PluginDir" -ForegroundColor Green

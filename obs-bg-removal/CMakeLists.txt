@@ -37,7 +37,9 @@ if(ENABLE_QT)
 endif()
 
 # ONNX Runtime (DirectML NuGet build)
-set(ONNXRUNTIME_DIR "C:/Projects/deps/onnxruntime" CACHE PATH "Path to ONNX Runtime")
+# Defaults to a repo-local deps/onnxruntime folder (git-ignored via deps/).
+# Override with -DONNXRUNTIME_DIR=<path> if your ONNX Runtime lives elsewhere.
+set(ONNXRUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/onnxruntime" CACHE PATH "Path to ONNX Runtime")
 
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     ${ONNXRUNTIME_DIR}/include
