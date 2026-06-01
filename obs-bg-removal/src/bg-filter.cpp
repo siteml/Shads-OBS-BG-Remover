@@ -12,6 +12,10 @@
 #include <condition_variable>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#pragma comment(lib, "dxgi.lib")
 
 // ----------------------------------------------------------
 // SAFETY LIMITS
@@ -29,6 +33,7 @@
 #define PROP_EDGE_BLUR    "edge_blur"
 #define PROP_INFER_SCALE  "infer_scale"
 #define PROP_RESPONSIVENESS "responsiveness"
+#define PROP_DEVICE       "inference_device"
 
 // ----------------------------------------------------------
 // Filter data
@@ -93,6 +98,8 @@ struct bg_filter_data {
 	float      responsiveness;
 	uint32_t   prev_infer_w;  // detect dimension changes to reset states
 	uint32_t   prev_infer_h;
+	int        device_id;        // desired DML adapter index (-1 = CPU)
+	int        active_device_id; // device the live session is bound to
 };
 
 // ----------------------------------------------------------
@@ -115,6 +122,79 @@ static bool validate_dims(uint32_t w, uint32_t h)
 {
 	return w >= MIN_WIDTH && h >= MIN_HEIGHT &&
 	       w <= MAX_WIDTH && h <= MAX_HEIGHT;
+}
+
+// ----------------------------------------------------------
+// DirectML adapter enumeration
+//
+// The DML execution provider picks a GPU by an integer device id that
+// matches the DXGI adapter enumeration order. We enumerate the same way
+// here so the dropdown index lines up with what DML expects, and so we
+// can show real adapter names instead of opaque numbers.
+// ----------------------------------------------------------
+struct dml_adapter_info {
+	int         index;          // DXGI index == DML device id
+	std::string name;
+	uint32_t    vendor_id;
+	uint64_t    dedicated_vram;
+};
+
+static std::vector<dml_adapter_info> enumerate_dml_adapters()
+{
+	std::vector<dml_adapter_info> out;
+
+	Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
+		return out;
+
+	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+	for (UINT i = 0;
+	     factory->EnumAdapters1(i, adapter.ReleaseAndGetAddressOf())
+		     != DXGI_ERROR_NOT_FOUND;
+	     i++) {
+		DXGI_ADAPTER_DESC1 desc;
+		if (FAILED(adapter->GetDesc1(&desc)))
+			continue;
+		// Skip the Microsoft Basic Render Driver (software fallback)
+		if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
+			continue;
+
+		char namebuf[256] = {0};
+		WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1,
+				    namebuf, sizeof(namebuf) - 1,
+				    nullptr, nullptr);
+
+		dml_adapter_info info;
+		info.index          = (int)i;
+		info.name           = namebuf;
+		info.vendor_id      = desc.VendorId;
+		info.dedicated_vram = desc.DedicatedVideoMemory;
+		out.push_back(std::move(info));
+	}
+	return out;
+}
+
+// ----------------------------------------------------------
+// Tear down the ONNX session + inference thread so the caller can
+// re-init. Used on resolution change and on inference-device change.
+// Must be called from the render thread.
+// ----------------------------------------------------------
+static void teardown_inference(bg_filter_data *f)
+{
+	f->running.store(false);
+	f->frame_cv.notify_all();
+	if (f->infer_thread.joinable())
+		f->infer_thread.join();
+	f->initialized = false;
+	f->has_mask.store(false);
+	f->prev_mask.clear();
+	f->r1.clear(); f->r1_shape = {1,1,1,1};
+	f->r2.clear(); f->r2_shape = {1,1,1,1};
+	f->r3.clear(); f->r3_shape = {1,1,1,1};
+	f->r4.clear(); f->r4_shape = {1,1,1,1};
+	delete f->session;     f->session     = nullptr;
+	delete f->memory_info; f->memory_info = nullptr;
+	delete f->env;         f->env         = nullptr;
 }
 
 // ----------------------------------------------------------
@@ -468,28 +548,51 @@ static bool init_onnx(bg_filter_data *f, uint32_t W, uint32_t H)
 		// but is not exported from onnxruntime.lib, so we use GetProcAddress.
 		typedef OrtStatus *(ORT_API_CALL *DML_FN)(OrtSessionOptions *, int);
 		f->using_cuda = false;
-		HMODULE hOrt = GetModuleHandleA("onnxruntime.dll");
-		if (hOrt) {
-			DML_FN dml_fn = (DML_FN)GetProcAddress(
-				hOrt, "OrtSessionOptionsAppendExecutionProvider_DML");
-			if (dml_fn) {
-				OrtStatus *dml_st = dml_fn(opts, 0);
-				if (dml_st == nullptr) {
-					f->using_cuda = true;
-					obs_log(LOG_INFO,
-						"BG Removal: DirectML provider OK (GPU)");
+
+		// Which adapter did the user pick? (-1 = force CPU)
+		int dev;
+		{
+			std::lock_guard<std::mutex> lock(f->settings_mutex);
+			dev = f->device_id;
+		}
+		f->active_device_id = dev;
+
+		// Resolve a readable name for logging / verification.
+		std::string dev_name = "CPU";
+		if (dev >= 0) {
+			for (const auto &a : enumerate_dml_adapters())
+				if (a.index == dev) dev_name = a.name;
+		}
+
+		if (dev < 0) {
+			obs_log(LOG_INFO,
+				"BG Removal: Inference device = CPU (user-selected)");
+		} else {
+			HMODULE hOrt = GetModuleHandleA("onnxruntime.dll");
+			if (hOrt) {
+				DML_FN dml_fn = (DML_FN)GetProcAddress(
+					hOrt, "OrtSessionOptionsAppendExecutionProvider_DML");
+				if (dml_fn) {
+					OrtStatus *dml_st = dml_fn(opts, dev);
+					if (dml_st == nullptr) {
+						f->using_cuda = true;
+						obs_log(LOG_INFO,
+							"BG Removal: DirectML provider OK on device %d (%s)",
+							dev, dev_name.c_str());
+					} else {
+						obs_log(LOG_WARNING,
+							"BG Removal: DirectML device %d (%s) error, using CPU",
+							dev, dev_name.c_str());
+						Ort::GetApi().ReleaseStatus(dml_st);
+					}
 				} else {
 					obs_log(LOG_WARNING,
-						"BG Removal: DirectML returned error, using CPU");
-					Ort::GetApi().ReleaseStatus(dml_st);
+						"BG Removal: DML function not found in onnxruntime.dll, using CPU");
 				}
 			} else {
 				obs_log(LOG_WARNING,
-					"BG Removal: DML function not found in onnxruntime.dll, using CPU");
+					"BG Removal: onnxruntime.dll not loaded yet, using CPU");
 			}
-		} else {
-			obs_log(LOG_WARNING,
-				"BG Removal: onnxruntime.dll not loaded yet, using CPU");
 		}
 
 		char *mpath = obs_module_file("models/rvm_mobilenetv3_fp32.onnx");
@@ -569,6 +672,25 @@ static obs_properties_t *bg_filter_properties(void *data)
 	// --- Performance ---
 	obs_properties_add_text(props, "info_perf",
 		"<b>Performance</b>", OBS_TEXT_INFO);
+
+	// Inference device picker (multi-GPU offload)
+	p = obs_properties_add_list(props, PROP_DEVICE,
+		"Inference Device",
+		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	for (const auto &a : enumerate_dml_adapters()) {
+		char label[320];
+		double gb = (double)a.dedicated_vram /
+			    (1024.0 * 1024.0 * 1024.0);
+		snprintf(label, sizeof(label), "%s (%.1f GB)",
+			 a.name.c_str(), gb);
+		obs_property_list_add_int(p, label, a.index);
+	}
+	obs_property_list_add_int(p, "CPU (no GPU acceleration)", -1);
+	obs_property_set_long_description(p,
+		"Which GPU runs the AI inference. On a multi-GPU system you can "
+		"offload this to a secondary card (e.g. an Intel Arc) to free up "
+		"your main GPU for rendering and encoding. Changing this rebuilds "
+		"the model session.");
 
 	p = obs_properties_add_float_slider(props, PROP_INFER_SCALE,
 		"Inference Scale", 0.25, 1.0, 0.05);
@@ -656,6 +778,7 @@ static obs_properties_t *bg_filter_properties(void *data)
 
 static void bg_filter_defaults(obs_data_t *settings)
 {
+	obs_data_set_default_int(settings, PROP_DEVICE, 0);
 	obs_data_set_default_double(settings, PROP_INFER_SCALE, 0.25);
 	obs_data_set_default_double(settings, PROP_RESPONSIVENESS, 0.0);
 	obs_data_set_default_double(settings, PROP_THRESHOLD, 0.15);
@@ -677,6 +800,7 @@ static void bg_filter_update(void *data, obs_data_t *settings)
 	f->edge_blur = (int)obs_data_get_int(settings, PROP_EDGE_BLUR);
 	f->infer_scale     = (float)obs_data_get_double(settings, PROP_INFER_SCALE);
 	f->responsiveness  = (float)obs_data_get_double(settings, PROP_RESPONSIVENESS);
+	f->device_id       = (int)obs_data_get_int(settings, PROP_DEVICE);
 }
 
 // ----------------------------------------------------------
@@ -726,6 +850,8 @@ static void *bg_filter_create(obs_data_t *settings, obs_source_t *source)
 	f->responsiveness  = 0.0f;
 	f->prev_infer_w    = 0;
 	f->prev_infer_h    = 0;
+	f->device_id       = 0;
+	f->active_device_id = -2;  // sentinel: no live session yet
 
 	bg_filter_update(f, settings);
 
@@ -815,7 +941,11 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 
 	uint32_t W = obs_source_get_base_width(target);
 	uint32_t H = obs_source_get_base_height(target);
-	if (!W || !H || W > MAX_WIDTH || H > MAX_HEIGHT) {
+	// Sources can briefly report tiny/zero dimensions while warming up
+	// (e.g. 1x1 before a webcam is ready). Treat anything below the minimum
+	// as "not ready yet" and skip just this frame, so we retry next frame
+	// instead of permanently failing the filter.
+	if (W < MIN_WIDTH || H < MIN_HEIGHT || W > MAX_WIDTH || H > MAX_HEIGHT) {
 		obs_source_skip_video_filter(f->source);
 		return;
 	}
@@ -824,19 +954,20 @@ static void bg_filter_render(void *data, gs_effect_t *effect)
 	if (f->initialized && (W != f->width || H != f->height)) {
 		obs_log(LOG_INFO, "BG Removal: Resolution changed %dx%d -> %dx%d",
 			f->width, f->height, W, H);
-		f->running.store(false);
-		f->frame_cv.notify_all();
-		if (f->infer_thread.joinable()) f->infer_thread.join();
-		f->initialized = false;
-		f->has_mask.store(false);
-		f->prev_mask.clear();
-		f->r1.clear(); f->r1_shape = {1,1,1,1};
-		f->r2.clear(); f->r2_shape = {1,1,1,1};
-		f->r3.clear(); f->r3_shape = {1,1,1,1};
-		f->r4.clear(); f->r4_shape = {1,1,1,1};
-		delete f->session;     f->session     = nullptr;
-		delete f->memory_info; f->memory_info = nullptr;
-		delete f->env;         f->env         = nullptr;
+		teardown_inference(f);
+	}
+
+	// Reinit on inference-device change (user picked a different GPU)
+	int desired_dev;
+	{
+		std::lock_guard<std::mutex> lock(f->settings_mutex);
+		desired_dev = f->device_id;
+	}
+	if (f->initialized && desired_dev != f->active_device_id) {
+		obs_log(LOG_INFO,
+			"BG Removal: Inference device changed %d -> %d, rebuilding session",
+			f->active_device_id, desired_dev);
+		teardown_inference(f);
 	}
 
 	if (!f->initialized) {
