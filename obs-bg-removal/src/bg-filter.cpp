@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #pragma comment(lib, "dxgi.lib")
@@ -385,6 +386,20 @@ static void inference_thread_func(bg_filter_data *f)
 {
 	obs_log(LOG_INFO, "BG Removal: Inference thread started");
 
+	// Backstop against long-term recurrent drift (see the decay cap below):
+	// hard-zero the state once a minute. One imperceptible frame re-bootstraps
+	// the recurrence, guaranteeing recovery even from a bad state.
+	auto last_state_reset = std::chrono::steady_clock::now();
+	const auto STATE_RESET_INTERVAL = std::chrono::seconds(60);
+
+	// Fast collapse recovery: if the matte goes essentially empty for a short
+	// run of frames, the recurrent state has gone bad - zero it immediately so
+	// the next frame recovers, rather than waiting up to a minute for the
+	// periodic reset. Re-armed once real foreground reappears, so simply
+	// leaving the frame doesn't cause repeated resets.
+	int  empty_run      = 0;
+	bool collapse_armed = true;
+
 	while (f->running.load()) {
 		{
 			std::unique_lock<std::mutex> lock(f->frame_mutex);
@@ -452,6 +467,18 @@ static void inference_thread_func(bg_filter_data *f)
 			f->prev_infer_h = IH;
 		}
 
+		// Periodic recurrent-state reset backstop (drift insurance).
+		{
+			auto now = std::chrono::steady_clock::now();
+			if (now - last_state_reset > STATE_RESET_INTERVAL) {
+				std::fill(f->r1.begin(), f->r1.end(), 0.0f);
+				std::fill(f->r2.begin(), f->r2.end(), 0.0f);
+				std::fill(f->r3.begin(), f->r3.end(), 0.0f);
+				std::fill(f->r4.begin(), f->r4.end(), 0.0f);
+				last_state_reset = now;
+			}
+		}
+
 		uint32_t PIW = ((IW + 15) / 16) * 16;
 		uint32_t PIH = ((IH + 15) / 16) * 16;
 		size_t   infer_pixels = (size_t)PIW * PIH;
@@ -481,8 +508,16 @@ static void inference_thread_func(bg_filter_data *f)
 			// Responsiveness: decay recurrent states to reduce temporal
 			// memory. 1.0 = treat each frame independently; 0.0 = full
 			// temporal memory (smoothest but laggiest). Shared by both backends.
-			if (responsiveness > 0.001f) {
+			//
+			// We ALWAYS bleed off at least a little. Pure feedback (keep==1,
+			// i.e. Responsiveness 0) lets the recurrent state slowly drift over
+			// a long session - especially in fp16 - until the matte collapses
+			// and the whole frame reads as background. Capping keep bounds the
+			// loop gain below 1 so the state settles instead of accumulating;
+			// ~1-2s of temporal memory remains, which is plenty for stability.
+			{
 				float keep = 1.0f - responsiveness;
+				if (keep > 0.99f) keep = 0.99f;
 				for (auto &v : f->r1) v *= keep;
 				for (auto &v : f->r2) v *= keep;
 				for (auto &v : f->r3) v *= keep;
@@ -585,6 +620,34 @@ static void inference_thread_func(bg_filter_data *f)
 
 			const float *pha = pha_buf.data();
 
+			// State sanity check at the SOURCE. An fp16 spike in a recurrent
+			// feature-map cell would otherwise spread one cell per frame, which
+			// is the hard-edged rectangular front you can watch wipe across the
+			// matte over a second or two. RVM's ConvGRU states are a convex blend
+			// of tanh outputs, so they normally stay within +/-1; anything
+			// non-finite or past +/-10 is a runaway. Zero the state the instant
+			// it appears, before it can propagate into a visible sweep.
+			{
+				bool bad = false;
+				auto scan = [&](const std::vector<float> &s) {
+					if (bad) return;
+					for (float v : s)
+						if (!std::isfinite(v) || v > 10.0f || v < -10.0f) {
+							bad = true; return;
+						}
+				};
+				scan(f->r1); scan(f->r2); scan(f->r3); scan(f->r4);
+				if (bad) {
+					std::fill(f->r1.begin(), f->r1.end(), 0.0f);
+					std::fill(f->r2.begin(), f->r2.end(), 0.0f);
+					std::fill(f->r3.begin(), f->r3.end(), 0.0f);
+					std::fill(f->r4.begin(), f->r4.end(), 0.0f);
+					empty_run = 0;
+					obs_log(LOG_INFO,
+						"BG Removal: recurrent state out of range - reset at source");
+				}
+			}
+
 			size_t infer_unpadded = (size_t)IW * IH;
 
 			// M6: init prev_mask at inference resolution
@@ -660,6 +723,36 @@ static void inference_thread_func(bg_filter_data *f)
 					}
 				}
 				small_mask = std::move(blurred);
+			}
+
+			// Collapse detection: a healthy matte always has a meaningful
+			// chunk of foreground. Near-zero for several frames in a row means
+			// the recurrent state has drifted bad, so hard-reset it now and
+			// recover within ~a frame instead of waiting on the periodic timer.
+			{
+				size_t fg = 0;
+				for (size_t i = 0; i < infer_unpadded; i++)
+					if (small_mask[i] > 127) fg++;
+				float fg_frac = infer_unpadded
+					? (float)fg / (float)infer_unpadded : 0.0f;
+				const float COLLAPSE_FG = 0.003f; // <0.3% = essentially empty
+				const int   COLLAPSE_N  = 8;      // sustained frames
+				if (fg_frac < COLLAPSE_FG) {
+					if (++empty_run >= COLLAPSE_N && collapse_armed) {
+						std::fill(f->r1.begin(), f->r1.end(), 0.0f);
+						std::fill(f->r2.begin(), f->r2.end(), 0.0f);
+						std::fill(f->r3.begin(), f->r3.end(), 0.0f);
+						std::fill(f->r4.begin(), f->r4.end(), 0.0f);
+						std::fill(f->prev_mask.begin(),
+							  f->prev_mask.end(), 0.0f);
+						collapse_armed = false;
+						obs_log(LOG_INFO,
+							"BG Removal: matte collapse detected - resetting recurrent state");
+					}
+				} else {
+					empty_run = 0;
+					collapse_armed = true;
+				}
 			}
 
 			// Step 4: Write small mask as RGBA (GPU does the upscale)
