@@ -14,6 +14,7 @@
 !CMakeLists.txt
 !CMakePresets.json
 !Deploy-BGRemoval.ps1
+!Deploy-BGRemoval.cmd
 !fetch-openvino.cmd
 !LICENSE
 !README.md
